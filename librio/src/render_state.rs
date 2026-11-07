@@ -19,6 +19,7 @@ use rio_vt::crosswords::Crosswords;
 use rio_vt::event::sync::FairMutex;
 use rio_vt::event::TerminalDamage;
 use rustc_hash::FxHashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,10 +120,26 @@ impl RenderState {
     }
 
     pub fn update(&mut self) {
+        self.update_inner(None);
+    }
+
+    /// Same snapshot as [`update`]. Clears `frame_flag` while the terminal
+    /// mutex is still held, after `damage_event_in_flight` is cleared, and
+    /// also on an unexpired synchronized-output hold. The store stays inside
+    /// the lock so a PTY wakeup, which sets the flag from `notify_damage`
+    /// under that same mutex, cannot land between the clear and the unlock.
+    pub fn update_rearm(&mut self, frame_flag: &AtomicBool) {
+        self.update_inner(Some(frame_flag));
+    }
+
+    fn update_inner(&mut self, frame_flag: Option<&AtomicBool>) {
         let mut term = self.terminal.lock();
         if term.synchronized_output() {
             if !term.sync_update_expired(rio_vt::time::Instant::now()) {
                 term.damage_event_in_flight = false;
+                if let Some(flag) = frame_flag {
+                    flag.store(false, Ordering::Release);
+                }
                 return;
             }
             term.end_sync_update();
@@ -143,6 +160,9 @@ impl RenderState {
         );
         term.reset_damage();
         term.damage_event_in_flight = false;
+        if let Some(flag) = frame_flag {
+            flag.store(false, Ordering::Release);
+        }
         self.columns = term.grid.columns();
         self.display_offset = term.display_offset();
         // Kitty dest_rows live in absolute row space: rows evicted from
