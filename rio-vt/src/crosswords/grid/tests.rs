@@ -167,7 +167,7 @@ fn shrink_reflow() {
     grid[Line(0)][Column(3)] = cell('4');
     grid[Line(0)][Column(4)] = cell('5');
 
-    grid.resize(true, 1, 2);
+    grid.resize(true, 1, 2, false);
 
     assert_eq!(grid.total_lines(), 3);
 
@@ -193,8 +193,8 @@ fn shrink_reflow_twice() {
     grid[Line(0)][Column(3)] = cell('4');
     grid[Line(0)][Column(4)] = cell('5');
 
-    grid.resize(true, 1, 4);
-    grid.resize(true, 1, 2);
+    grid.resize(true, 1, 4, false);
+    grid.resize(true, 1, 2, false);
 
     assert_eq!(grid.total_lines(), 3);
 
@@ -220,7 +220,7 @@ fn shrink_reflow_empty_cell_inside_line() {
     grid[Line(0)][Column(3)] = cell('4');
     grid[Line(0)][Column(4)] = Square::default();
 
-    grid.resize(true, 1, 2);
+    grid.resize(true, 1, 2, false);
 
     assert_eq!(grid.total_lines(), 2);
 
@@ -232,7 +232,7 @@ fn shrink_reflow_empty_cell_inside_line() {
     assert_eq!(grid[Line(0)][Column(0)], cell('3'));
     assert_eq!(grid[Line(0)][Column(1)], cell('4'));
 
-    grid.resize(true, 1, 1);
+    grid.resize(true, 1, 1, false);
 
     assert_eq!(grid.total_lines(), 4);
 
@@ -257,7 +257,7 @@ fn grow_reflow() {
     grid[Line(1)][Column(0)] = cell('3');
     grid[Line(1)][Column(1)] = Square::default();
 
-    grid.resize(true, 2, 3);
+    grid.resize(true, 2, 3, false);
 
     assert_eq!(grid.total_lines(), 2);
 
@@ -283,7 +283,7 @@ fn grow_reflow_multiline() {
     grid[Line(2)][Column(0)] = cell('5');
     grid[Line(2)][Column(1)] = cell('6');
 
-    grid.resize(true, 3, 6);
+    grid.resize(true, 3, 6, false);
 
     assert_eq!(grid.total_lines(), 3);
 
@@ -312,7 +312,7 @@ fn grow_reflow_disabled() {
     grid[Line(1)][Column(0)] = cell('3');
     grid[Line(1)][Column(1)] = Square::default();
 
-    grid.resize(false, 2, 3);
+    grid.resize(false, 2, 3, false);
 
     assert_eq!(grid.total_lines(), 2);
 
@@ -336,7 +336,7 @@ fn shrink_reflow_disabled() {
     grid[Line(0)][Column(3)] = cell('4');
     grid[Line(0)][Column(4)] = cell('5');
 
-    grid.resize(false, 1, 2);
+    grid.resize(false, 1, 2, false);
 
     assert_eq!(grid.total_lines(), 1);
 
@@ -373,10 +373,9 @@ fn spacer_cell() -> Square {
 
 #[test]
 fn shrink_reflow_remap_tracks_displaced_wide_char() {
-    // A wrapped tail of exactly `columns - 1` cells is buffered into
-    // the next row, whose first cell is a wide char. The spacer logic
-    // displaces that wide char into the following push, so the remap
-    // must record the row after the one receiving the buffered tail.
+    // Wrap is on column 6, not the last cell, so the wide-char row is
+    // not joined. The blank row under the cursor is pruned. The content
+    // row still splits, and the wide char keeps its own row.
     let mut grid = Grid::<Square>::new(3, 8, 4);
     for (n, c) in "1234567".chars().enumerate() {
         grid[Line(0)][Column(n)] = cell(c);
@@ -387,21 +386,16 @@ fn shrink_reflow_remap_tracks_displaced_wide_char() {
     grid[Line(1)][Column(2)] = cell('x');
 
     grid.track_reflow_remap = true;
-    grid.resize(true, 3, 4);
+    grid.resize(true, 3, 4, false);
     grid.track_reflow_remap = false;
 
     let remap = grid.reflow_remap.take().expect("remap must be recorded");
     assert_eq!(remap.base_abs, 0);
-    // Old row 0 lands at 0; the wide-char row's first cell lands at 2
-    // (position 1 holds the buffered "567" tail plus the spacer); the
-    // trailing blank row lands at 3.
-    assert_eq!(remap.new_pos, vec![0, 2, 3]);
-
-    // Cross-check against where the wide char actually sits.
-    let total = grid.total_lines() as i32;
-    let screen = grid.screen_lines() as i32;
-    let wide_line = Line(2 - (total - screen));
-    assert_eq!(grid[wide_line][Column(0)], wide_cell('W'));
+    // The blank row under the cursor is pruned before reflow, so only
+    // the content row and the wide-char row are mapped. "1234567" splits
+    // into two rows and the wide char stays on its own row after that.
+    assert_eq!(remap.new_pos, vec![0, 2]);
+    assert_eq!(grid[Line(2)][Column(0)], wide_cell('W'));
 }
 
 #[test]
@@ -419,13 +413,123 @@ fn grow_reflow_remap_tracks_unmerged_wide_char() {
     grid[Line(1)][Column(1)] = spacer_cell();
 
     grid.track_reflow_remap = true;
-    grid.resize(true, 2, 5);
+    grid.resize(true, 2, 5, false);
     grid.track_reflow_remap = false;
 
     let remap = grid.reflow_remap.take().expect("remap must be recorded");
     assert_eq!(remap.base_abs, 0);
     assert_eq!(remap.new_pos, vec![0, 1]);
     assert_eq!(grid[Line(1)][Column(0)], wide_cell('W'));
+}
+
+#[test]
+fn reflow_drops_trailing_spaces() {
+    let mut grid = Grid::<Square>::new(1, 8, 2);
+    for (i, ch) in "hello   ".chars().enumerate() {
+        grid[Line(0)][Column(i)] = cell(ch);
+    }
+
+    grid.resize(true, 1, 6, false);
+
+    assert_eq!(grid.total_lines(), 1);
+    for (i, ch) in "hello".chars().enumerate() {
+        assert_eq!(grid[Line(0)][Column(i)], cell(ch));
+    }
+    assert_eq!(grid[Line(0)][Column(5)], Square::default());
+
+    // Six cells already fit, so the trailing space stays.
+    let mut kept = Grid::<Square>::new(1, 8, 2);
+    for (i, ch) in "hello ".chars().enumerate() {
+        kept[Line(0)][Column(i)] = cell(ch);
+    }
+    kept.resize(true, 1, 6, false);
+    assert_eq!(kept.total_lines(), 1);
+    assert_eq!(kept[Line(0)][Column(5)], cell(' '));
+}
+
+#[test]
+fn reflow_column_zero_cursor_on_unwrapped_line() {
+    let mut shrunk = Grid::<Square>::new(2, 4, 0);
+    shrunk[Line(0)][Column(0)] = cell('A');
+    shrunk[Line(1)][Column(0)] = cell('B');
+    shrunk.cursor.pos = Pos::new(Line(1), Column(0));
+    shrunk.resize(true, 2, 2, false);
+    assert_eq!(shrunk.cursor.pos, Pos::new(Line(0), Column(0)));
+    assert!(!shrunk.cursor.should_wrap);
+
+    let mut grown = Grid::<Square>::new(2, 4, 0);
+    grown[Line(0)][Column(0)] = cell('A');
+    grown[Line(1)][Column(0)] = cell('B');
+    grown.cursor.pos = Pos::new(Line(1), Column(0));
+    grown.resize(true, 2, 8, false);
+    assert_eq!(grown.cursor.pos, Pos::new(Line(0), Column(7)));
+    assert!(grown.cursor.should_wrap);
+}
+
+#[test]
+fn reflow_prune_blank_tail_does_not_enter_history() {
+    let mut grid = Grid::<Square>::new(4, 5, 10);
+    grid[Line(0)][Column(0)] = cell('A');
+    grid[Line(1)][Column(0)] = cell('B');
+    grid.cursor.pos = Pos::new(Line(1), Column(0));
+
+    grid.resize(true, 2, 3, false);
+
+    assert_eq!(grid.history_size(), 0);
+    assert_eq!(grid.screen_lines(), 2);
+    assert_eq!(grid[Line(0)][Column(0)], cell('A'));
+    assert_eq!(grid[Line(1)][Column(0)], cell('B'));
+}
+
+#[test]
+fn resize_preserve_scrollback_pads_without_pulling_history() {
+    let mut grid = Grid::<Square>::new(2, 2, 10);
+    grid[Line(0)][Column(0)] = cell('A');
+    grid[Line(1)][Column(0)] = cell('B');
+    grid.scroll_up(&(Line(0)..Line(2)), 1);
+    assert_eq!(grid[Line(-1)][Column(0)], cell('A'));
+    assert_eq!(grid[Line(0)][Column(0)], cell('B'));
+    assert_eq!(grid.history_size(), 1);
+
+    grid.resize(true, 4, 2, true);
+
+    assert_eq!(grid[Line(-1)][Column(0)], cell('A'));
+    assert_eq!(grid[Line(0)][Column(0)], cell('B'));
+    assert_eq!(grid[Line(1)][Column(0)], Square::default());
+    assert_eq!(grid.history_size(), 1);
+}
+
+#[test]
+fn resize_without_preserve_pulls_history() {
+    let mut grid = Grid::<Square>::new(2, 2, 10);
+    grid[Line(0)][Column(0)] = cell('A');
+    grid[Line(1)][Column(0)] = cell('B');
+    grid.scroll_up(&(Line(0)..Line(2)), 1);
+
+    grid.resize(true, 4, 2, false);
+
+    let visible = (0..grid.screen_lines())
+        .any(|line| grid[Line(line as i32)][Column(0)] == cell('A'));
+    assert!(
+        visible,
+        "bottom gravity pulls scrolled lines back on screen"
+    );
+}
+
+#[test]
+fn reflow_round_trip_rejoins_wrapped_line() {
+    let mut grid = Grid::<Square>::new(1, 10, 10);
+    for (i, ch) in "abcdefghij".chars().enumerate() {
+        grid[Line(0)][Column(i)] = cell(ch);
+    }
+
+    grid.resize(true, 1, 4, false);
+    grid.resize(true, 1, 10, false);
+
+    assert_eq!(grid.total_lines(), 1);
+    for (i, ch) in "abcdefghij".chars().enumerate() {
+        assert_eq!(grid[Line(0)][Column(i)], cell(ch));
+    }
 }
 
 #[test]
@@ -500,7 +604,7 @@ fn extras_reclaim_keeps_ids_of_hidden_cached_rows() {
     // Shrinking with the cursor at the top drops the bottom rows into
     // Storage's hidden cache; their extras must stay live while the
     // unreferenced slot is freed.
-    grid.resize(false, 2, 2);
+    grid.resize(false, 2, 2, false);
     grid.reclaim_extras();
     assert!(grid.extras_table.get(id).is_some());
     assert!(grid.extras_table.get(dead).is_none());

@@ -490,6 +490,11 @@ where
     keyboard_mode_idx: usize,
     inactive_keyboard_mode_stack: [u8; KEYBOARD_MODE_STACK_MAX_DEPTH],
     inactive_keyboard_mode_idx: usize,
+
+    /// When set, growing the screen pads blank rows under the cursor
+    /// and leaves scrollback where it is. Windows ConPTY needs this;
+    /// other hosts leave it false and keep bottom gravity.
+    resize_preserves_scrollback: bool,
 }
 
 impl<U: EventListener> Crosswords<U> {
@@ -550,7 +555,16 @@ impl<U: EventListener> Crosswords<U> {
             keyboard_mode_idx: 0,
             inactive_keyboard_mode_stack: Default::default(),
             inactive_keyboard_mode_idx: 0,
+            resize_preserves_scrollback: false,
         }
+    }
+
+    /// Growing the screen pads blank rows under the cursor and leaves
+    /// scrollback where it is. Windows ConPTY needs this; other hosts
+    /// leave it false and keep bottom gravity. `resize` reads the flag
+    /// so its `Dimensions` argument stays unchanged.
+    pub fn set_resize_preserves_scrollback(&mut self, preserve: bool) {
+        self.resize_preserves_scrollback = preserve;
     }
 
     /// Configure the default for grapheme cluster processing (DEC
@@ -891,8 +905,10 @@ impl<U: EventListener> Crosswords<U> {
         let is_alt = self.mode.contains(Mode::ALT_SCREEN);
         self.grid.track_reflow_remap = active_has_placements;
         self.inactive_grid.track_reflow_remap = inactive_has_placements;
-        self.grid.resize(!is_alt, num_lines, num_cols);
-        self.inactive_grid.resize(is_alt, num_lines, num_cols);
+        let preserve = self.resize_preserves_scrollback;
+        self.grid.resize(!is_alt, num_lines, num_cols, preserve);
+        self.inactive_grid
+            .resize(is_alt, num_lines, num_cols, preserve);
         self.grid.track_reflow_remap = false;
         self.inactive_grid.track_reflow_remap = false;
         let active_remap = self.grid.reflow_remap.take();

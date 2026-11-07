@@ -666,6 +666,15 @@ impl Surface {
         }));
     }
 
+    /// Growing the screen pads blank rows instead of pulling scrollback
+    /// into the viewport. A Windows host sets this for ConPTY. macOS and
+    /// Linux leave it false. Does not change `resize`'s four arguments.
+    pub fn set_resize_preserves_scrollback(&self, preserve: bool) {
+        self.terminal
+            .lock()
+            .set_resize_preserves_scrollback(preserve);
+    }
+
     /// A wheel scroll, dispatched the way terminals do it: the program
     /// running in the terminal gets first claim.
     ///

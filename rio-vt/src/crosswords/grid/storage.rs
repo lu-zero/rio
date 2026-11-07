@@ -331,6 +331,16 @@ impl<T> Storage<T> {
         self.zero = 0;
     }
 
+    /// Pair `replace_inner` with a new viewport height.
+    ///
+    /// `replace_inner` updates `len` and leaves `visible_lines` alone.
+    /// A prune that drops blank viewport rows has to move both, or
+    /// `compute_index` addresses the wrong slot.
+    #[inline]
+    pub(super) fn set_visible_lines(&mut self, visible_lines: usize) {
+        self.visible_lines = visible_lines;
+    }
+
     /// Remove all rows from storage.
     #[inline]
     pub fn take_all(&mut self) -> Vec<Row<T>> {
