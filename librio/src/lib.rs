@@ -610,6 +610,19 @@ impl Surface {
         bits
     }
 
+    /// Report terminal focus to the program when it requested focus events
+    /// (DECSET 1004). A no-op otherwise.
+    pub fn notify_focus(&self, focused: bool) {
+        let report = self.terminal.lock().mode().contains(Mode::FOCUS_IN_OUT);
+        if report {
+            self.write(if focused {
+                b"\x1b[I".to_vec()
+            } else {
+                b"\x1b[O".to_vec()
+            });
+        }
+    }
+
     /// Whether alt acts as meta, prefixing with ESC, instead of letting the
     /// platform's text through. See [`key::EncodeContext::alt_is_meta`].
     pub fn set_alt_is_meta(&self, enabled: bool) {
