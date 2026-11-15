@@ -18,6 +18,7 @@ struct TestPty {
     shutdown_calls: usize,
     deregister_calls: usize,
     raw_error: Option<i32>,
+    winsizes: Vec<WinsizeBuilder>,
 }
 
 impl Read for TestPty {
@@ -54,7 +55,8 @@ impl ProcessReadWrite for TestPty {
     fn write_token(&self) -> corcovado::Token {
         1.into()
     }
-    fn set_winsize(&mut self, _: WinsizeBuilder) -> io::Result<()> {
+    fn set_winsize(&mut self, size: WinsizeBuilder) -> io::Result<()> {
+        self.winsizes.push(size);
         Ok(())
     }
     fn register(
@@ -134,6 +136,7 @@ fn machine(bytes: Vec<u8>, ending: Option<ErrorKind>) -> Machine<TestPty, VoidLi
             shutdown_calls: 0,
             deregister_calls: 0,
             raw_error: None,
+            winsizes: Vec::new(),
         },
         VoidListener,
         WindowId::from(0),
@@ -471,4 +474,30 @@ fn an_empty_input_does_not_hold_back_the_next_one() {
     machine.pty_write(&mut state).unwrap();
     assert_eq!(machine.pty.writer, b"ls\r");
     assert!(!state.needs_write());
+}
+
+#[test]
+fn a_burst_of_resizes_reaches_the_child_once_it_settles() {
+    let mut machine = machine(Vec::new(), None);
+    let mut state = State::default();
+    let channel = machine.channel();
+    for cols in [79, 78, 77] {
+        channel
+            .send(Msg::Resize(crate::event::WindowSize {
+                rows: 24,
+                cols,
+                width: cols * 8,
+                height: 384,
+            }))
+            .unwrap();
+    }
+    assert!(machine.drain_recv_channel(&mut state));
+
+    machine.settle_resize(&mut state, Instant::now());
+    assert!(machine.pty.winsizes.is_empty());
+
+    machine.settle_resize(&mut state, Instant::now() + RESIZE_SETTLE);
+    let cols: Vec<u16> = machine.pty.winsizes.iter().map(|size| size.cols).collect();
+    assert_eq!(cols, [77]);
+    assert!(state.pending_size.is_none());
 }
