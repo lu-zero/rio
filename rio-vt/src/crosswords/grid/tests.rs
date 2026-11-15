@@ -735,3 +735,29 @@ fn prev_on_a_stale_position_ends_instead_of_panicking() {
     assert_eq!(it.prev().map(|i| i.pos), Some(Pos::new(Line(0), Column(0))));
     assert!(it.prev().is_none());
 }
+
+#[test]
+fn shrink_counts_a_displaced_wide_char_in_the_cursor_column() {
+    let mut grid = Grid::<Square>::new(1, 8, 10);
+    let cells = [
+        cell('a'),
+        cell('b'),
+        cell('c'),
+        wide_cell('中'),
+        spacer_cell(),
+        cell('d'),
+        cell('e'),
+        cell('f'),
+    ];
+    for (i, c) in cells.into_iter().enumerate() {
+        grid[Line(0)][Column(i)] = c;
+    }
+    grid.cursor.pos = Pos::new(Line(0), Column(7));
+
+    grid.resize(true, 1, 4);
+
+    // [abc<leading spacer>] [中<spacer>de] [f...]
+    assert_eq!(grid[Line(-1)][Column(0)], wide_cell('中'));
+    assert_eq!(grid[Line(0)][Column(0)], cell('f'));
+    assert_eq!(grid.cursor.pos, Pos::new(Line(0), Column(0)));
+}

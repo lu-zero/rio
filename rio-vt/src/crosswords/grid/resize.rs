@@ -511,17 +511,19 @@ impl Grid<Square> {
                     // Reflow cursor if a line below it is deleted.
                     let cursor_buffer_line =
                         self.lines - self.cursor.pos.row.0 as usize - 1;
-                    if (i == cursor_buffer_line && self.cursor.pos.col < columns)
+                    // A wide char displaced by the spacer starts the next row.
+                    let kept = columns - displaced as usize;
+                    if (i == cursor_buffer_line && self.cursor.pos.col < kept)
                         || i < cursor_buffer_line
                     {
                         self.cursor.pos.row = max(self.cursor.pos.row - 1, Line(0));
                     }
 
                     // Reflow the cursor if it is on this line beyond the width.
-                    if i == cursor_buffer_line && self.cursor.pos.col >= columns {
-                        // Since only a single new line is created, we subtract only `columns`
+                    if i == cursor_buffer_line && self.cursor.pos.col >= kept {
+                        // Since only a single new line is created, we subtract only `kept`
                         // from the cursor instead of reflowing it completely.
-                        self.cursor.pos.col -= columns;
+                        self.cursor.pos.col -= kept;
                     }
 
                     // Make sure new row is at least as long as new width.
