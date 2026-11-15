@@ -431,7 +431,12 @@ const TITLE_STACK_MAX_DEPTH: usize = 4096;
 // Max size of the keyboard modes.
 const KEYBOARD_MODE_STACK_MAX_DEPTH: usize = 8;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
+struct PromptInput {
+    cursor: usize,
+    rows: usize,
+}
+
 pub struct Crosswords<U>
 where
     U: EventListener,
@@ -492,6 +497,8 @@ where
     /// When the running shell command started its output (OSC 133 `C`),
     /// so `D` can report how long it ran. `None` between commands.
     command_started_at: Option<crate::time::Instant>,
+    /// Between OSC 133 `A` and `C`: the shell is at its prompt, and redraws it on SIGWINCH.
+    at_prompt: bool,
 
     /// What DECRQM callers see after a full reset: the
     /// consumer-configured default for grapheme clustering (mode
@@ -574,6 +581,7 @@ impl<U: EventListener> Crosswords<U> {
             focused: false,
             program_status_seen: false,
             command_started_at: None,
+            at_prompt: false,
             modify_other_keys: 0,
             keyboard_mode_stack: Default::default(),
             keyboard_mode_idx: 0,
@@ -596,6 +604,66 @@ impl<U: EventListener> Crosswords<U> {
     pub fn set_grapheme_clustering(&mut self, enabled: bool) {
         self.grapheme_clustering_default = enabled;
         self.mode.set(Mode::GRAPHEME_CLUSTER, enabled);
+    }
+
+    /// The row of the last prompt mark at or above the cursor.
+    fn prompt_head(&self) -> Option<Line> {
+        let top = -(self.grid.history_size() as i32);
+        (top..=self.grid.cursor.pos.row.0)
+            .rev()
+            .map(Line)
+            .find(|&line| {
+                self.grid[line].semantic_prompt != grid::row::SemanticPrompt::None
+            })
+    }
+
+    /// The cursor's row within the prompt's last line and the rows that line
+    /// takes, as the shell laid them out.
+    fn prompt_input(&self) -> Option<PromptInput> {
+        let head = self.prompt_head()?;
+        let last = self.grid.last_column();
+        let mut rows: i32 = 1;
+        while head.0 + rows <= self.grid.bottommost_line().0
+            && self.grid[Line(head.0 + rows - 1)][last].wrapline()
+        {
+            rows += 1;
+        }
+        let cursor = (self.grid.cursor.pos.row - head).0 as usize;
+        Some(PromptInput {
+            cursor,
+            rows: rows.max(cursor as i32 + 1) as usize,
+        })
+    }
+
+    /// A shell redraws its prompt's last line after a resize by moving up the
+    /// rows its old layout put the cursor below it. Rewrapped, that lands on
+    /// the line above; so the cursor goes back that many rows below the line's
+    /// start, with room for the old layout under it. Rows below the cursor are
+    /// left for the shell to clear: blanking them would read as free space.
+    fn clear_prompt_input(&mut self, input: PromptInput) {
+        let Some(mut head) = self.prompt_head() else {
+            return;
+        };
+        let lines = self.grid.screen_lines() as i32;
+        let overflow = head.0 + input.rows as i32 - lines;
+        if overflow > 0 {
+            self.grid
+                .scroll_up(&(Line(0)..Line(lines)), overflow as usize);
+            head -= overflow;
+        }
+        if head < 0 {
+            return;
+        }
+        let mark = self.grid[head].semantic_prompt;
+        let template = Square::default();
+        let cursor = head + input.cursor as i32;
+        for line in head.0..=cursor.0 {
+            self.grid[Line(line)].reset(&template);
+        }
+        self.grid[head].semantic_prompt = mark;
+        self.grid.cursor.pos = Pos::new(cursor, Column(0));
+        self.grid.cursor.should_wrap = false;
+        self.mark_fully_damaged();
     }
 
     pub fn mark_fully_damaged(&mut self) {
@@ -924,6 +992,9 @@ impl<U: EventListener> Crosswords<U> {
                 .is_empty();
 
         let is_alt = self.mode.contains(Mode::ALT_SCREEN);
+        let input = (self.at_prompt && !is_alt && old_cols != num_cols)
+            .then(|| self.prompt_input())
+            .flatten();
         self.grid.track_reflow_remap = active_has_placements;
         self.inactive_grid.track_reflow_remap = inactive_has_placements;
         self.grid.resize(!is_alt, num_lines, num_cols);
@@ -932,6 +1003,9 @@ impl<U: EventListener> Crosswords<U> {
         self.inactive_grid.track_reflow_remap = false;
         let active_remap = self.grid.reflow_remap.take();
         let inactive_remap = self.inactive_grid.reflow_remap.take();
+        if let Some(input) = input {
+            self.clear_prompt_input(input);
+        }
 
         // Invalidate selection and tabs only when necessary.
         if old_cols != num_cols {
@@ -3664,6 +3738,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
     }
 
     fn prompt_start(&mut self) {
+        self.at_prompt = true;
         // A running command stays open across `A`: a program that
         // draws prompts of its own (a shell on an `ssh` host, a nested
         // shell) must not make the shell's eventual `D` go unreported.
@@ -3678,6 +3753,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
     }
 
     fn command_start(&mut self) {
+        self.at_prompt = false;
         // A repeated `C` restarts the clock: the latest output mark is
         // the one whose `D` will follow.
         self.command_started_at = Some(crate::time::Instant::now());
@@ -7827,6 +7903,54 @@ mod tests {
         assert_eq!(cw.grid.cursor.pos, Pos::new(Line(first + 1), Column(3)));
         assert!(!cw.grid.cursor.should_wrap);
         assert!(first >= 0, "the joined line is on screen, not in history");
+    }
+
+    // At its prompt a shell redraws the input after a resize by moving up the
+    // rows its old layout put the cursor below the input's first row. The
+    // cursor goes back to that offset, even though the reflow joined the rows.
+    #[test]
+    fn at_a_prompt_the_cursor_keeps_its_row_below_the_input_start() {
+        use crate::crosswords::grid::row::SemanticPrompt;
+        let prompt = |cw: &mut Crosswords<VoidListener>| {
+            cw.prompt_start();
+            cw.set_semantic_prompt(SemanticPrompt::PromptContinuation);
+            cw.input_str("> abcdefghijkl");
+            assert_eq!(cw.grid.cursor.pos, Pos::new(Line(1), Column(4)));
+        };
+        let mut cw = Crosswords::new(
+            CrosswordsSize::new(10, 4),
+            CursorShape::Block,
+            VoidListener {},
+            crate::event::WindowId::from(0),
+            0,
+            10,
+        );
+        prompt(&mut cw);
+
+        cw.resize(CrosswordsSize::new(20, 4));
+
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(1), Column(0)));
+        assert!(cw.grid[Line(0)].is_clear());
+        assert_eq!(
+            cw.grid[Line(0)].semantic_prompt,
+            SemanticPrompt::PromptContinuation
+        );
+
+        // Once a command runs, its output reflows like any other.
+        let mut cw = Crosswords::new(
+            CrosswordsSize::new(10, 4),
+            CursorShape::Block,
+            VoidListener {},
+            crate::event::WindowId::from(0),
+            0,
+            10,
+        );
+        prompt(&mut cw);
+        cw.command_start();
+
+        cw.resize(CrosswordsSize::new(20, 4));
+
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(0), Column(14)));
     }
 
     // A resize that keeps the columns rotates the selection with the
