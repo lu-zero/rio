@@ -99,6 +99,14 @@ impl Grid<Square> {
         self.display_offset = min(self.display_offset, self.history_size());
     }
 
+    /// Blank screen rows below the cursor, counted up from the bottom.
+    fn clear_rows_below_cursor(&self) -> usize {
+        let below = self.lines - 1 - self.cursor.pos.row.0 as usize;
+        (0..below)
+            .take_while(|&k| self[Line((self.lines - 1 - k) as i32)].is_clear())
+            .count()
+    }
+
     /// Grow number of columns in each row, reflowing if necessary.
     fn grow_columns(&mut self, reflow: bool, columns: usize) {
         // Check if a row needs to be wrapped.
@@ -124,6 +132,12 @@ impl Grid<Square> {
             self.raw.grow_all_rows(columns);
             return;
         }
+
+        // A screen with room below the cursor keeps its top row: rejoined rows
+        // leave blank rows at the bottom instead of pulling history back in.
+        let anchor_top = reflow && self.clear_rows_below_cursor() > 0;
+        let top_row = self.lines - 1;
+        let mut top_pos = 0;
 
         self.columns = columns;
 
@@ -156,6 +170,9 @@ impl Grid<Square> {
                 Some(last_row) if should_reflow(last_row) => last_row,
                 _ => {
                     reversed.push(row);
+                    if i == top_row {
+                        top_pos = reversed.len() - 1;
+                    }
                     if let Some(r) = remap.as_mut() {
                         r.new_pos[old_len - 1 - i] = (reversed.len() - 1) as i64;
                     }
@@ -210,6 +227,10 @@ impl Grid<Square> {
                 if let Some(r) = remap.as_mut() {
                     r.new_pos[old_len - 1 - i] = merge_target as i64;
                 }
+            }
+            if i == top_row {
+                // Kept on this row, it is pushed right after the merge target.
+                top_pos = merge_target + usize::from(!first_cell_moved);
             }
 
             let cursor_buffer_line = self.lines - self.cursor.pos.row.0 as usize - 1;
@@ -290,6 +311,13 @@ impl Grid<Square> {
             self.cursor.pos.row = max(self.cursor.pos.row - overflow, Line(0));
         }
 
+        let history = reversed.len() - self.lines;
+        if anchor_top && top_pos > history {
+            let blank = min(top_pos - history, self.cursor.pos.row.0 as usize);
+            reversed.extend((0..blank).map(|_| Row::new(columns)));
+            self.cursor.pos.row -= blank;
+        }
+
         // Restore oldest-first order in place and fill all rows that are
         // still too short. Reusing `reversed` avoids allocating a second
         // full row buffer, which matters when reflowing a long scrollback.
@@ -356,6 +384,10 @@ impl Grid<Square> {
 
         let mut new_raw = Vec::with_capacity(self.raw.len());
         let mut buffered: Option<Vec<Square>> = None;
+        let top_row = self.lines - 1;
+        let mut top_pos = 0;
+        // Rows the cursor would have moved above the top of the screen.
+        let mut cursor_above = 0;
 
         let mut rows = self.raw.take_all();
         let old_len = rows.len();
@@ -378,6 +410,9 @@ impl Grid<Square> {
             if remap.is_some() {
                 let own_first = buffered.as_ref().map_or(0, |b| b.len()) as i64;
                 trackers.push((old_len - 1 - i, own_first));
+            }
+            if i == top_row {
+                top_pos = new_raw.len();
             }
 
             // Append lines left over from the previous row.
@@ -516,7 +551,11 @@ impl Grid<Square> {
                     if (i == cursor_buffer_line && self.cursor.pos.col < kept)
                         || i < cursor_buffer_line
                     {
-                        self.cursor.pos.row = max(self.cursor.pos.row - 1, Line(0));
+                        if self.cursor.pos.row == 0 {
+                            cursor_above += 1;
+                        } else {
+                            self.cursor.pos.row -= 1;
+                        }
                     }
 
                     // Reflow the cursor if it is on this line beyond the width.
@@ -538,6 +577,26 @@ impl Grid<Square> {
                         self.display_offset += 1;
                     }
                 }
+            }
+        }
+
+        // Wrapped rows take the blank rows below the cursor before the top of
+        // the screen goes into history, so a cleared screen stays clear.
+        let cursor_row = self.cursor.pos.row.0 - cursor_above;
+        let below = (self.lines as i32 - 1 - cursor_row) as usize;
+        let clear = new_raw
+            .iter()
+            .rev()
+            .take(below)
+            .take_while(|row| row.is_clear())
+            .count();
+        let pushed = (new_raw.len() - self.lines).saturating_sub(top_pos);
+        let blank = min(clear, pushed);
+        new_raw.truncate(new_raw.len() - blank);
+        self.cursor.pos.row = Line(max(cursor_row + blank as i32, 0));
+        if let Some(r) = remap.as_mut() {
+            for pos in r.new_pos.iter_mut().filter(|p| **p >= new_raw.len() as i64) {
+                *pos = -1;
             }
         }
 

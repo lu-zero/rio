@@ -7742,11 +7742,11 @@ mod tests {
         }
     }
 
-    // Shrinking the columns wraps the cursor's line. The cursor keeps
-    // its screen row, so the half of the line above it goes to history,
-    // and it stays after the last character it was after. The saved
-    // cursor is only clamped to the new width, not reflowed. Growing
-    // back joins the line and the cursor follows.
+    // Shrinking the columns wraps the cursor's line into the blank rows
+    // below it, so the line stays on screen and the cursor stays after
+    // the last character it was after. The saved cursor is only clamped
+    // to the new width, not reflowed. Growing back joins the line and
+    // the cursor follows.
     #[test]
     fn cursor_and_saved_cursor_after_a_reflow() {
         let mut cw = Crosswords::new(
@@ -7768,11 +7768,11 @@ mod tests {
             let row = &cw.grid[Line(line)];
             (0..row.len()).map(|c| row[Column(c)].c()).collect()
         };
-        assert_eq!(cw.history_size(), 1);
-        assert_eq!(text(&cw, -1), "abcde");
-        assert!(cw.grid[Line(-1)][Column(4)].wrapline());
-        assert_eq!(text(&cw, 0), "fghij");
-        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(0), Column(4)));
+        assert_eq!(cw.history_size(), 0);
+        assert_eq!(text(&cw, 0), "abcde");
+        assert!(cw.grid[Line(0)][Column(4)].wrapline());
+        assert_eq!(text(&cw, 1), "fghij");
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(1), Column(4)));
         assert!(
             cw.grid.cursor.should_wrap,
             "still pending a wrap after the j"
@@ -7805,10 +7805,10 @@ mod tests {
         );
         cw.input_str("abcdefghij");
         cw.resize(CrosswordsSize::new(5, 4));
-        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(0), Column(4)));
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(1), Column(4)));
         // Three more cells wrap onto the next row: "klm" below "fghij".
         cw.input_str("klm");
-        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(1), Column(3)));
+        assert_eq!(cw.grid.cursor.pos, Pos::new(Line(2), Column(3)));
         assert!(!cw.grid.cursor.should_wrap);
 
         cw.resize(CrosswordsSize::new(10, 4));

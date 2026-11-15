@@ -394,8 +394,8 @@ fn shrink_reflow_remap_tracks_displaced_wide_char() {
     assert_eq!(remap.base_abs, 0);
     // Old row 0 lands at 0; the wide-char row's first cell lands at 2
     // (position 1 holds the buffered "567" tail plus the spacer); the
-    // trailing blank row lands at 3.
-    assert_eq!(remap.new_pos, vec![0, 2, 3]);
+    // trailing blank row gives way to the wrapped rows.
+    assert_eq!(remap.new_pos, vec![0, 2, -1]);
 
     // Cross-check against where the wide char actually sits.
     let total = grid.total_lines() as i32;
@@ -760,4 +760,59 @@ fn shrink_counts_a_displaced_wide_char_in_the_cursor_column() {
     assert_eq!(grid[Line(-1)][Column(0)], wide_cell('中'));
     assert_eq!(grid[Line(0)][Column(0)], cell('f'));
     assert_eq!(grid.cursor.pos, Pos::new(Line(0), Column(0)));
+}
+
+fn put(grid: &mut Grid<Square>, line: i32, text: &str) {
+    for (i, c) in text.chars().enumerate() {
+        grid[Line(line)][Column(i)] = cell(c);
+    }
+}
+
+// A cleared screen: old output in history, the prompt line on the top
+// row with the cursor in the middle of it, blank rows below.
+#[test]
+fn a_round_trip_with_room_below_leaves_history_alone() {
+    let mut grid = Grid::<Square>::new(4, 10, 10);
+    put(&mut grid, 0, "old");
+    grid.scroll_up(&(Line(0)..Line(4)), 1);
+    put(&mut grid, 0, "abcdefghij");
+    grid.cursor.pos = Pos::new(Line(0), Column(3));
+    assert_eq!(grid.history_size(), 1);
+
+    grid.resize(true, 4, 4);
+
+    assert_eq!(grid.history_size(), 1);
+    assert_eq!(grid[Line(0)][Column(3)], wrap_cell('d'));
+    assert_eq!(grid[Line(2)][Column(1)], cell('j'));
+    assert_eq!(grid.cursor.pos, Pos::new(Line(0), Column(3)));
+
+    grid.resize(true, 4, 10);
+
+    assert_eq!(grid.history_size(), 1);
+    assert_eq!(grid[Line(-1)][Column(0)], cell('o'));
+    assert_eq!(grid[Line(0)][Column(9)], cell('j'));
+    assert!(grid[Line(1)].is_clear());
+    assert_eq!(grid.cursor.pos, Pos::new(Line(0), Column(3)));
+}
+
+// A full screen has no room: the wrap pushes its top into history and
+// the grow pulls it back.
+#[test]
+fn a_round_trip_on_a_full_screen_goes_through_history() {
+    let mut grid = Grid::<Square>::new(2, 10, 10);
+    put(&mut grid, 0, "top");
+    put(&mut grid, 1, "abcdefghij");
+    grid.cursor.pos = Pos::new(Line(1), Column(3));
+
+    grid.resize(true, 2, 5);
+
+    assert_eq!(grid.history_size(), 1);
+    assert_eq!(grid[Line(-1)][Column(0)], cell('t'));
+    assert_eq!(grid.cursor.pos, Pos::new(Line(0), Column(3)));
+
+    grid.resize(true, 2, 10);
+
+    assert_eq!(grid.history_size(), 0);
+    assert_eq!(grid[Line(0)][Column(0)], cell('t'));
+    assert_eq!(grid.cursor.pos, Pos::new(Line(1), Column(3)));
 }
