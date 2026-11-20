@@ -118,9 +118,11 @@ pub enum ClickState {
 /// - `Noop` — no terminal-side change worth rendering for
 /// - `Full` — global state changed (resize, palette, mode flip),
 ///   force a full rebuild even if no individual row is dirty
-/// - `Partial` — at least one row's content changed; the snapshot's
-///   per-row dirty bits identify which rows
-/// - `CursorOnly` — cursor moved/blinked, no cell content changed
+/// - `Partial`: at least one row's content changed, or the cursor
+///   moved (its row and the row it left shape differently, so both
+///   are marked); the snapshot's per-row dirty bits identify which rows
+/// - `CursorOnly`: the cursor blinked or the window focus changed;
+///   set by the UI, never by the terminal, and no row is rebuilt
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TerminalDamage {
     /// Nothing changed — skip rendering entirely
@@ -130,7 +132,7 @@ pub enum TerminalDamage {
     Full,
     /// At least one row changed; consult per-row dirty bits
     Partial,
-    /// Only the cursor position has changed
+    /// Only the cursor's visibility changed: a blink, a focus change
     CursorOnly,
 }
 
@@ -175,6 +177,19 @@ pub enum RioEvent {
     GlyphProtocolQuery {
         route_id: usize,
         cp: u32,
+    },
+    /// A `q;grapheme=` request (spec §5.3) arrived from the PTY in
+    /// `route_id`. `one_cell` is the terminal's half of the answer:
+    /// whether the cluster, printed at the cursor in the current mode,
+    /// lands in a single cell. The frontend adds the font half, by
+    /// resolving and shaping the cluster the way the grid draws it,
+    /// and passes the reply back as the answer to a query only it can
+    /// answer, which lowers the fence the query raised. Only sent
+    /// when the session opted in with `set_glyph_grapheme_query`.
+    GlyphProtocolGraphemeQuery {
+        route_id: usize,
+        cps: Vec<char>,
+        one_cell: bool,
     },
     Paste,
     Copy(String),
@@ -390,6 +405,16 @@ impl Debug for RioEvent {
             }
             RioEvent::GlyphProtocolQuery { route_id, cp } => {
                 write!(f, "GlyphProtocolQuery route {route_id} cp {cp:#x}")
+            }
+            RioEvent::GlyphProtocolGraphemeQuery {
+                route_id,
+                cps,
+                one_cell,
+            } => {
+                write!(
+                    f,
+                    "GlyphProtocolGraphemeQuery route {route_id} cps {cps:?} one_cell {one_cell}"
+                )
             }
             RioEvent::Scroll(scroll) => write!(f, "Scroll {scroll:?}"),
             RioEvent::Bell(route_id) => write!(f, "Bell route {route_id}"),

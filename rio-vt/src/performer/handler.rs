@@ -466,6 +466,27 @@ pub trait Handler {
     /// writes it back to the originating pane's PTY directly.
     fn glyph_query(&mut self, _cp: u32) {}
 
+    /// Payload formats this host accepts: what the `s` reply lists, and
+    /// the only ones `r` takes. Empty switches Glyph Protocol off: its
+    /// messages are ignored and `s` goes unanswered, which is how a
+    /// client tells the protocol is unsupported (§3.4).
+    fn glyph_formats(&self) -> &'static [glyph_protocol::GlyphFormat] {
+        glyph_protocol::GlyphFormat::ALL
+    }
+
+    /// Whether this host answers grapheme queries (`q;grapheme=`,
+    /// spec §5.3). Drives both the `cap=grapheme` advertisement in the
+    /// `s` reply and the `reason=unsupported` answer, so the two can
+    /// never disagree. Off unless the frontend that renders the
+    /// session opted in: only it can shape the cluster.
+    fn glyph_grapheme_query_enabled(&self) -> bool {
+        false
+    }
+
+    /// Forward a grapheme query to the frontend. Only called when
+    /// [`Self::glyph_grapheme_query_enabled`] is `true`.
+    fn glyph_query_grapheme(&mut self, _cps: Vec<char>) {}
+
     /// Get mutable access to the kitty graphics chunking state
     /// Used by the APC handler to accumulate chunked image transmissions
     ///
@@ -614,10 +635,10 @@ impl<'a, H: Handler + 'a> Performer<'a, H> {
             String::from_utf8_lossy(&data[..data.len().min(50)])
         );
 
-        // Check if this is a Glyph Protocol APC (starts with "25a1").
+        // Check if this is a Glyph Protocol APC (starts with "25a1;").
         // Glyph Protocol is checked before Kitty so its fixed-string
         // prefix short-circuits quickly; the two prefixes are disjoint.
-        if data.starts_with(glyph_protocol::GLYPH_PROTOCOL_PREFIX) {
+        if glyph_protocol::is_glyph_protocol(data) {
             // Copy the body off the shared apc_state buffer so that
             // dispatch_glyph_protocol can take `&mut self` (the handler
             // trait methods need it). Glyph Protocol payloads are
@@ -737,12 +758,31 @@ impl<'a, H: Handler + 'a> Performer<'a, H> {
     /// Parse and dispatch a Glyph Protocol APC. `data` starts with the
     /// `25a1` identifier and excludes the APC introducer / terminator.
     fn dispatch_glyph_protocol(&mut self, data: &[u8]) {
-        match glyph_protocol::parse(data) {
+        let formats = self.handler.glyph_formats();
+        if formats.is_empty() {
+            return;
+        }
+        match glyph_protocol::parse_with(data, formats) {
             Ok(glyph_protocol::GlyphCommand::Support) => {
-                let resp = glyph_protocol::format_support_response(
-                    glyph_protocol::SUPPORTED_FORMATS,
-                );
+                let caps: &[&str] = if self.handler.glyph_grapheme_query_enabled() {
+                    &[glyph_protocol::CAP_GRAPHEME]
+                } else {
+                    &[]
+                };
+                let resp = glyph_protocol::format_support_response(formats, caps);
                 self.handler.glyph_protocol_response(resp);
+            }
+            Ok(glyph_protocol::GlyphCommand::QueryGrapheme { cps }) => {
+                // Either way the answer keeps request order (§5.5): a
+                // forwarded query raises the fence like a `cp` query,
+                // and the `unsupported` reply waits behind any query
+                // still out.
+                if self.handler.glyph_grapheme_query_enabled() {
+                    self.handler.glyph_query_grapheme(cps);
+                } else {
+                    let resp = glyph_protocol::format_grapheme_query_unsupported(&cps);
+                    self.handler.glyph_protocol_response(resp);
+                }
             }
             Ok(glyph_protocol::GlyphCommand::Query { cp }) => {
                 // Fire-and-forget: the handler emits a frontend-bound
@@ -771,10 +811,12 @@ impl<'a, H: Handler + 'a> Performer<'a, H> {
                     }
                 }
             },
-            Ok(glyph_protocol::GlyphCommand::Clear { cp }) => {
+            Ok(glyph_protocol::GlyphCommand::Clear { cp, reply }) => {
                 self.handler.glyph_clear(cp);
-                let resp = glyph_protocol::format_clear_ok(cp);
-                self.handler.glyph_protocol_response(resp);
+                if reply.emit_success() {
+                    let resp = glyph_protocol::format_clear_ok(cp);
+                    self.handler.glyph_protocol_response(resp);
+                }
             }
             Err(glyph_protocol::ParseError::NotGlyphProtocol) => {
                 // Shouldn't happen — the prefix check in process_apc_buffer
@@ -788,12 +830,19 @@ impl<'a, H: Handler + 'a> Performer<'a, H> {
                     self.handler.glyph_protocol_response(resp);
                 }
             }
-            Err(glyph_protocol::ParseError::ClearOutOfNamespace) => {
-                let resp = glyph_protocol::format_clear_error_out_of_namespace();
-                self.handler.glyph_protocol_response(resp);
+            Err(glyph_protocol::ParseError::ClearOutOfNamespace { cp, reply }) => {
+                if reply.emit_error() {
+                    let resp = glyph_protocol::format_clear_error_out_of_namespace(cp);
+                    self.handler.glyph_protocol_response(resp);
+                }
             }
             Err(glyph_protocol::ParseError::Malformed(why)) => {
                 warn!("[glyph_protocol] malformed APC: {why}");
+            }
+            Err(glyph_protocol::ParseError::QueryMalformed(why)) => {
+                warn!("[glyph_protocol] malformed query: {why}");
+                let resp = glyph_protocol::format_query_malformed();
+                self.handler.glyph_protocol_response(resp);
             }
         }
     }

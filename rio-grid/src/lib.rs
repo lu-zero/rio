@@ -43,6 +43,21 @@ use smallvec::SmallVec;
 /// cells. The renderer reads via `extras.get(&id)`.
 pub type ExtrasMap = FxHashMap<u16, Extras>;
 
+/// The Glyph Protocol registration a cell was printed with, as its
+/// registry version: what the cell draws, whatever is registered at the
+/// codepoint now (spec §6.3). Only block codepoints can carry one, so
+/// every other cell skips the extras lookup. A bg-only cell keeps its
+/// colour where a text cell keeps its codepoint and extras id, so it is
+/// ruled out first rather than read as either.
+#[inline]
+fn bound_glyph_version(extras_table: &ExtrasMap, sq: Square) -> Option<u32> {
+    use rio_backend::sugarloaf::font::glyph_registry::in_registration_block;
+    if sq.is_bg_only() || !in_registration_block(sq.c() as u32) {
+        return None;
+    }
+    extras_table.get(&sq.extras_id_checked()?)?.glyph
+}
+
 pub mod preedit;
 use preedit::{PreeditCaret, PreeditCell, PreeditLine};
 
@@ -1322,17 +1337,16 @@ struct RunCacheEntry {
 }
 
 pub struct GridGlyphRasterizer {
-    /// Cache of `(char, style_flags, route_id) → (font_id, is_emoji)`
-    /// resolutions. The route_id is part of the key because Glyph
-    /// Protocol registrations are per-pane: the same PUA codepoint
-    /// can resolve to `CUSTOM_GLYPH_FONT_ID` in one pane and to a
-    /// system font in another. Non-PUA characters resolve identically
-    /// across panes; the duplication is cheap (a few bytes per
-    /// (char, route) pair) compared to the cost of mis-rendering.
-    font_resolve: FxHashMap<(char, u8, usize), (u32, bool)>,
+    /// Cache of `(char, style_flags) → (font_id, is_emoji)`
+    /// resolutions. The same in every pane: Glyph Protocol glyphs don't
+    /// resolve through fonts, a cell printed with a registration says so
+    /// itself (see `bound_glyph_version`).
+    font_resolve: FxHashMap<(char, u8), (u32, bool)>,
     ascent_cache: FxHashMap<(u32, u16), i16>,
     /// Atlas ids for Glyph Protocol rasterisations.
     custom_glyph_ids: CustomGlyphIds,
+    /// What the atlas key needs from each Glyph Protocol registration.
+    custom_glyph_meta: CustomGlyphMetas,
     /// `(should_embolden, should_italicize)` per font_id. Read from
     /// `FontData` synthesis flags; matches the rich-text rasterizer's
     /// convention.
@@ -1415,6 +1429,7 @@ impl GridGlyphRasterizer {
             font_resolve: FxHashMap::default(),
             ascent_cache: FxHashMap::default(),
             custom_glyph_ids: CustomGlyphIds::default(),
+            custom_glyph_meta: CustomGlyphMetas::default(),
             synthesis_cache: FxHashMap::default(),
             run_cache: new_run_cache(),
             run_hasher: rapidhash::fast::RapidHasher::default(),
@@ -1480,7 +1495,6 @@ impl GridGlyphRasterizer {
         ch: char,
         style_flags: u8,
         font_library: &FontLibrary,
-        route_id: usize,
     ) -> (u32, bool) {
         // Kitty Unicode placeholder cells (U+10EEEE) are rendered as
         // image-overlay slices, not text. Resolve them to the primary
@@ -1493,9 +1507,7 @@ impl GridGlyphRasterizer {
 
         // ASCII printable + regular style → always primary font, never
         // emoji. Skips the FxHashMap lookup that dominates this fn's
-        // cost on terminal-typical content. ASCII codepoints can never
-        // be Glyph-Protocol-registered (PUA-only restriction), so the
-        // route_id is irrelevant on this fast path.
+        // cost on terminal-typical content.
         //
         // Bold / italic ASCII still goes through the cache because
         // the bold and italic font IDs are dynamic (depend on which
@@ -1506,11 +1518,10 @@ impl GridGlyphRasterizer {
 
         *self
             .font_resolve
-            .entry((ch, style_flags, route_id))
+            .entry((ch, style_flags))
             .or_insert_with(|| {
                 let span_style = span_style_for_flags(style_flags);
-                let (id, emoji) =
-                    font_library.resolve_font_for_char(ch, &span_style, Some(route_id));
+                let (id, emoji) = font_library.resolve_font_for_char(ch, &span_style);
                 (id as u32, emoji)
             })
     }
@@ -1527,6 +1538,167 @@ impl GridGlyphRasterizer {
             (fd.should_embolden, fd.should_italicize)
         })
     }
+}
+
+impl GridGlyphRasterizer {
+    /// The font half of a Glyph Protocol grapheme query (spec §5.3),
+    /// for a cluster the terminal already found would land in one
+    /// cell. It replays what [`build_row_fg`] does with that cell,
+    /// regular face:
+    ///
+    /// - The font comes from the base codepoint; the attached
+    ///   codepoints are shaped with the base in that same font. A
+    ///   registered block codepoint short-circuits to the registry and
+    ///   draws alone, so it answers `glossary` only when everything
+    ///   after it is default-ignorable.
+    /// - That font must have a glyph for every codepoint that is not
+    ///   default-ignorable. CoreText can cascade a missing codepoint
+    ///   to another font while shaping, but the grid draws the glyph id
+    ///   from the resolved font, so a cascaded glyph is not a correct
+    ///   render: coverage is checked against the resolved font itself.
+    /// - An emoji sequence must shape to exactly one advancing glyph,
+    ///   since UTS #51 defines it to display as a single image. Other
+    ///   scripts legitimately shape to several glyphs.
+    pub fn grapheme_query_status(
+        &mut self,
+        cps: &[char],
+        font_library: &FontLibrary,
+        route_id: usize,
+    ) -> rio_backend::ansi::glyph_protocol::QueryStatus {
+        use rio_backend::ansi::glyph_protocol::QueryStatus;
+        use rio_unicode::grapheme::is_default_ignorable;
+
+        let Some((&base, rest)) = cps.split_first() else {
+            return QueryStatus::Free;
+        };
+        let rest_ignorable = rest.iter().all(|&c| is_default_ignorable(c));
+
+        if font_library
+            .glyph_registry_for(route_id)
+            .is_some_and(|r| r.contains(base as u32))
+        {
+            if !rest_ignorable {
+                return QueryStatus::Free;
+            }
+            // Same pairing as a `cp` query (§5.2): the registration
+            // draws it, and a system font could too.
+            return if font_library.covers_codepoint(base as u32) {
+                QueryStatus::Both
+            } else {
+                QueryStatus::Glossary
+            };
+        }
+
+        let (font_id, _) = self.resolve_font(base, 0, font_library);
+        if !cps
+            .iter()
+            .filter(|&&c| !is_default_ignorable(c))
+            .all(|&c| font_covers(font_library, font_id, c))
+        {
+            return QueryStatus::Free;
+        }
+
+        if is_emoji_sequence(cps) {
+            let advancing = self.shape_cluster_for_query(cps, font_id, font_library);
+            if advancing != Some(1) {
+                return QueryStatus::Free;
+            }
+        }
+        QueryStatus::System
+    }
+
+    /// Shape `cps` in `font_id` the way the grid stages a cell (base,
+    /// then its attached codepoints minus VS15/VS16) and count the
+    /// glyphs that advance the pen. `None` when the font can't be
+    /// shaped. Leaves the run scratch empty, as every run start
+    /// expects.
+    fn shape_cluster_for_query(
+        &mut self,
+        cps: &[char],
+        font_id: u32,
+        font_library: &FontLibrary,
+    ) -> Option<usize> {
+        // Glyph count does not depend on size; any size works, and
+        // `None` keeps the nominal one out of the ascent cache.
+        const QUERY_SIZE: u16 = 16;
+        let (&base, rest) = cps.split_first()?;
+        #[cfg(target_os = "macos")]
+        {
+            self.run_utf16_scratch.clear();
+            let mut buf = [0u16; 2];
+            self.run_utf16_scratch
+                .extend_from_slice(base.encode_utf16(&mut buf));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.run_str_scratch.clear();
+            self.run_str_scratch.push(base);
+        }
+        push_cluster_chars(self, rest);
+
+        #[cfg(target_os = "macos")]
+        let shaped = shape_run_ct(self, font_id, QUERY_SIZE, None, font_library);
+        #[cfg(not(target_os = "macos"))]
+        let shaped = shape_run_swash(self, font_id, QUERY_SIZE, None, font_library);
+
+        #[cfg(target_os = "macos")]
+        self.run_utf16_scratch.clear();
+        #[cfg(not(target_os = "macos"))]
+        self.run_str_scratch.clear();
+
+        let (glyphs, _) = shaped?;
+        Some(glyphs.iter().filter(|g| g.advance > 0.0).count())
+    }
+}
+
+/// Whether the font registered under `font_id` has a glyph for `ch`.
+/// Font discovery never registers macOS's `LastResort` (see
+/// `sugarloaf::font::macos::discover_fallback`), so a codepoint no
+/// font has resolves to the primary, which lacks it.
+fn font_covers(font_library: &FontLibrary, font_id: u32, ch: char) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        font_library
+            .ct_font(font_id as usize)
+            .is_some_and(|handle| {
+                rio_backend::sugarloaf::font::macos::font_has_char(&handle, ch)
+            })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let lib = font_library.inner.read();
+        lib.get_data(&(font_id as usize))
+            .is_some_and(|(data, offset, key)| {
+                let font_ref = rio_backend::sugarloaf::swash::FontRef {
+                    data: data.as_ref(),
+                    offset,
+                    key,
+                };
+                font_ref.charmap().map(ch) != 0
+            })
+    }
+}
+
+/// Whether `cps` is an emoji sequence in the UTS #51 sense, which
+/// displays as a single image: an Extended_Pictographic or Regional
+/// Indicator base with something besides variation selectors after
+/// it (a ZWJ chain, a skin-tone modifier, a flag's second indicator,
+/// tag characters), or a keycap sequence (U+20E3).
+fn is_emoji_sequence(cps: &[char]) -> bool {
+    use rio_unicode::grapheme::{grapheme_class, GraphemeClass};
+    let Some((&base, rest)) = cps.split_first() else {
+        return false;
+    };
+    let mut rest = rest
+        .iter()
+        .filter(|&&c| !matches!(c, '\u{FE0E}' | '\u{FE0F}'));
+    if rest.clone().any(|&c| c == '\u{20E3}') {
+        return true;
+    }
+    matches!(
+        grapheme_class(base),
+        GraphemeClass::ExtPic | GraphemeClass::RegionalIndicator
+    ) && rest.next().is_some()
 }
 
 #[inline]
@@ -1682,12 +1854,16 @@ fn run_cache_put(buckets: &mut [Vec<RunCacheEntry>], entry: RunCacheEntry) {
 /// Shape a single run on macOS via CoreText and populate
 /// `out.ascent_px` as a side effect via the rasterizer's cache.
 /// Returns the glyph list if the handle is available.
+///
+/// `size_bucket` is `None` for a shape that is not drawn (a Glyph
+/// Protocol grapheme query): the ascent cache is keyed by bucket, so a
+/// nominal size must never populate it, and the returned ascent is 0.
 #[cfg(target_os = "macos")]
 fn shape_run_ct(
     rasterizer: &mut GridGlyphRasterizer,
     font_id: u32,
     size_u16: u16,
-    size_bucket: u16,
+    size_bucket: Option<u16>,
     font_library: &FontLibrary,
 ) -> Option<(Vec<ShapedGlyph>, i16)> {
     let (_, features) = rasterizer.library_settings(font_library);
@@ -1708,16 +1884,19 @@ fn shape_run_ct(
             h
         }
     };
-    let ascent_px = *rasterizer
-        .ascent_cache
-        .entry((font_id, size_bucket))
-        .or_insert_with(|| {
-            let m = rio_backend::sugarloaf::font::macos::font_metrics(
-                &handle,
-                size_u16 as f32,
-            );
-            rounded_ascent_px(m.ascent)
-        });
+    let ascent_px = match size_bucket {
+        Some(size_bucket) => *rasterizer
+            .ascent_cache
+            .entry((font_id, size_bucket))
+            .or_insert_with(|| {
+                let m = rio_backend::sugarloaf::font::macos::font_metrics(
+                    &handle,
+                    size_u16 as f32,
+                );
+                rounded_ascent_px(m.ascent)
+            }),
+        None => 0,
+    };
     let ct_glyphs = rio_backend::sugarloaf::font::macos::shape_text_utf16(
         &handle,
         &rasterizer.run_utf16_scratch,
@@ -1739,12 +1918,14 @@ fn shape_run_ct(
 /// Shape a single run on non-macOS via swash. Populates
 /// `rasterizer.ascent_cache` + `rasterizer.font_data_cache` as a side
 /// effect.
+/// `size_bucket` is `None` for a shape that is not drawn, as in
+/// [`shape_run_ct`].
 #[cfg(not(target_os = "macos"))]
 fn shape_run_swash(
     rasterizer: &mut GridGlyphRasterizer,
     font_id: u32,
     size_u16: u16,
-    size_bucket: u16,
+    size_bucket: Option<u16>,
     font_library: &FontLibrary,
 ) -> Option<(Vec<ShapedGlyph>, i16)> {
     use rio_backend::sugarloaf::swash::{FontRef, Setting};
@@ -1770,13 +1951,16 @@ fn shape_run_swash(
         key: font_entry.2,
     };
 
-    let ascent_px = *rasterizer
-        .ascent_cache
-        .entry((font_id, size_bucket))
-        .or_insert_with(|| {
-            let m = font_ref.metrics(&[]).scale(size_u16 as f32);
-            rounded_ascent_px(m.ascent)
-        });
+    let ascent_px = match size_bucket {
+        Some(size_bucket) => *rasterizer
+            .ascent_cache
+            .entry((font_id, size_bucket))
+            .or_insert_with(|| {
+                let m = font_ref.metrics(&[]).scale(size_u16 as f32);
+                rounded_ascent_px(m.ascent)
+            }),
+        None => 0,
+    };
 
     const WGHT_TAG: u32 = u32::from_be_bytes(*b"wght");
     let wght_var = wght.map(|v| Setting {
@@ -1836,11 +2020,21 @@ fn shape_cached(
         ));
     }
     #[cfg(target_os = "macos")]
-    let shaped_opt =
-        shape_run_ct(rasterizer, font_id, size_u16, size_bucket, font_library);
+    let shaped_opt = shape_run_ct(
+        rasterizer,
+        font_id,
+        size_u16,
+        Some(size_bucket),
+        font_library,
+    );
     #[cfg(not(target_os = "macos"))]
-    let shaped_opt =
-        shape_run_swash(rasterizer, font_id, size_u16, size_bucket, font_library);
+    let shaped_opt = shape_run_swash(
+        rasterizer,
+        font_id,
+        size_u16,
+        Some(size_bucket),
+        font_library,
+    );
     let (glyphs, ascent_px) = shaped_opt?;
     let advance: f32 = glyphs.iter().map(|g| g.advance).sum();
     run_cache_put(
@@ -1933,6 +2127,7 @@ pub fn build_row_fg<P: GridPalette>(
         row_hints,
         preedit,
         glyph_registry.as_ref(),
+        extras_table,
         fg_scratch,
     );
 
@@ -1972,18 +2167,20 @@ pub fn build_row_fg<P: GridPalette>(
         let run_start_style_id = sq.style_id();
         let run_style_flags =
             (resolve_style(row_styles, x).flags.bits() & SHAPING_FLAG_MASK) as u8;
-        let (font_id, is_emoji) =
-            rasterizer.resolve_font(ch, run_style_flags, font_library, route_id);
+        // Glyph Protocol: a cell printed with a registration draws it
+        // straight from the registry, without shaping, run-extension, or
+        // per-platform shaper plumbing, as its own one-cell run. Which
+        // registration is the cell's to say (§6.3), not the codepoint's.
+        let bound = bound_glyph_version(extras_table, sq);
+        let (font_id, is_emoji) = if bound.is_some() {
+            (CUSTOM_GLYPH_FONT_ID_U32, false)
+        } else {
+            rasterizer.resolve_font(ch, run_style_flags, font_library)
+        };
 
-        // Glyph Protocol short-circuit: registered codepoints render
-        // directly from the registry without shaping, run-extension,
-        // or per-platform shaper plumbing. Each registered cell is
-        // its own one-cell run.
-        if font_id == CUSTOM_GLYPH_FONT_ID_U32 {
-            // The font cascade reported a custom glyph but the row
-            // already cloned `glyph_registry` as None — registry was
-            // detached between font resolution and this branch (rare,
-            // but harmless: render nothing).
+        if let Some(version) = bound {
+            // A bound cell in a pane whose registry is gone (the session
+            // ended under the frame): render nothing.
             let Some(registry) = glyph_registry.as_ref() else {
                 x += 1;
                 continue;
@@ -2023,6 +2220,7 @@ pub fn build_row_fg<P: GridPalette>(
                 rasterizer,
                 registry,
                 ch as u32,
+                version,
                 cell_w_u32,
                 cell_h,
                 color,
@@ -2261,9 +2459,14 @@ pub fn build_row_fg<P: GridPalette>(
                 }
                 prev_style_id = style2_id;
             }
+            // A cell printed with a registration is a run of its own,
+            // even where its codepoint's fallback font matches the run.
+            if bound_glyph_version(extras_table, sq2).is_some() {
+                break;
+            }
             let ch2 = sq2.c();
             let (font_id2, _) =
-                rasterizer.resolve_font(ch2, run_style_flags, font_library, route_id);
+                rasterizer.resolve_font(ch2, run_style_flags, font_library);
             if font_id2 != font_id {
                 break;
             }
@@ -2487,7 +2690,6 @@ pub fn build_row_fg<P: GridPalette>(
                 rasterizer,
                 grid,
                 font_library,
-                route_id,
                 size_u16,
                 size_bucket,
                 cell_w,
@@ -2515,6 +2717,7 @@ pub fn build_row_fg<P: GridPalette>(
         row_hints,
         preedit,
         glyph_registry.as_ref(),
+        extras_table,
         fg_scratch,
     );
 
@@ -2633,7 +2836,6 @@ fn emit_preedit_cluster(
     rasterizer: &mut GridGlyphRasterizer,
     grid: &mut GridRenderer,
     font_library: &FontLibrary,
-    route_id: usize,
     size_u16: u16,
     size_bucket: u16,
     cell_w: f32,
@@ -2646,7 +2848,7 @@ fn emit_preedit_cluster(
     };
     let run_style_flags = 0u8;
     let (font_id, is_emoji) =
-        rasterizer.resolve_font(base, run_style_flags, font_library, route_id);
+        rasterizer.resolve_font(base, run_style_flags, font_library);
 
     // Layout reserves 1 or 2 cells per cluster; shaping draws natural
     // width. Per-char width sums misjudge both directions (a ZWJ emoji
@@ -2803,6 +3005,7 @@ fn custom_glyph_room(row: &Row<Square>, col: usize, cols: usize) -> u16 {
 fn custom_glyph_ink_covered(
     pre: &PreeditRow<'_>,
     registry: Option<&rio_backend::sugarloaf::font::glyph_registry::GlyphRegistry>,
+    extras_table: &ExtrasMap,
     sq: Square,
     col: usize,
     row: &Row<Square>,
@@ -2812,10 +3015,12 @@ fn custom_glyph_ink_covered(
         return false;
     };
     pre.covers_ink(col, 2)
-        && registry.get(sq.c() as u32).is_some_and(|entry| {
-            let room = custom_glyph_room(row, col, cols);
-            pre.covers_ink(col, custom_glyph_span(entry.width, room) as usize)
-        })
+        && bound_glyph_version(extras_table, sq)
+            .and_then(|version| registry.get_version(version))
+            .is_some_and(|entry| {
+                let room = custom_glyph_room(row, col, cols);
+                pre.covers_ink(col, custom_glyph_span(entry.width, room) as usize)
+            })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2834,6 +3039,7 @@ fn emit_underlines<P: GridPalette>(
     row_hints: &[RowHint],
     preedit: Option<&PreeditRow<'_>>,
     glyph_registry: Option<&rio_backend::sugarloaf::font::glyph_registry::GlyphRegistry>,
+    extras_table: &ExtrasMap,
     fg_scratch: &mut Vec<CellText>,
 ) {
     for x in 0..cols {
@@ -2859,7 +3065,7 @@ fn emit_underlines<P: GridPalette>(
             None => continue,
         };
         if preedit.is_some_and(|p| {
-            custom_glyph_ink_covered(p, glyph_registry, sq, x, row, cols)
+            custom_glyph_ink_covered(p, glyph_registry, extras_table, sq, x, row, cols)
         }) {
             continue;
         }
@@ -2918,6 +3124,7 @@ fn emit_strikethroughs<P: GridPalette>(
     row_hints: &[RowHint],
     preedit: Option<&PreeditRow<'_>>,
     glyph_registry: Option<&rio_backend::sugarloaf::font::glyph_registry::GlyphRegistry>,
+    extras_table: &ExtrasMap,
     fg_scratch: &mut Vec<CellText>,
 ) {
     for x in 0..cols {
@@ -2933,7 +3140,7 @@ fn emit_strikethroughs<P: GridPalette>(
             continue;
         }
         if preedit.is_some_and(|p| {
-            custom_glyph_ink_covered(p, glyph_registry, sq, x, row, cols)
+            custom_glyph_ink_covered(p, glyph_registry, extras_table, sq, x, row, cols)
         }) {
             continue;
         }
@@ -3096,26 +3303,94 @@ struct CustomGlyphRaster {
 
 fn custom_glyph_raster(
     codepoint: u32,
-    entry: &rio_backend::sugarloaf::font::glyph_registry::RegisteredGlyph,
+    version: u32,
+    meta: CustomGlyphMeta,
     span_w_px: u16,
     cell_h_px: u16,
     baseline_px: i16,
     foreground_rgba: [u8; 4],
 ) -> CustomGlyphRaster {
-    let uses_foreground = *entry.render_state.uses_foreground.get_or_init(|| {
-        rio_backend::sugarloaf::glyph_protocol::payload_uses_foreground(&entry.payload)
-    });
     CustomGlyphRaster {
         codepoint,
-        registration: entry.version,
+        registration: version,
         span_w: span_w_px,
         cell_h: cell_h_px,
         baseline: baseline_px,
-        foreground: if uses_foreground {
+        foreground: if meta.uses_foreground {
             foreground_rgba
         } else {
             [0; 4]
         },
+    }
+}
+
+/// What drawing a registration needs before it reaches the atlas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CustomGlyphMeta {
+    /// Declared render span, 1 or 2.
+    width: u8,
+    /// `align=_,baseline`: placed against the primary font's ascent.
+    baseline: bool,
+    /// The bitmap depends on the foreground colour.
+    uses_foreground: bool,
+    /// Rasterising it failed, so it draws nothing.
+    unrenderable: bool,
+}
+
+impl CustomGlyphMeta {
+    fn of(entry: &rio_backend::sugarloaf::font::glyph_registry::RegisteredGlyph) -> Self {
+        use rio_backend::sugarloaf::font::glyph_registry::GlyphAlignV;
+        use std::sync::atomic::Ordering;
+        Self {
+            width: entry.width,
+            baseline: entry.layout.align_v == GlyphAlignV::Baseline,
+            uses_foreground: *entry.render_state.uses_foreground.get_or_init(|| {
+                rio_backend::sugarloaf::glyph_protocol::payload_uses_foreground(
+                    &entry.payload,
+                )
+            }),
+            unrenderable: entry.render_state.unrenderable.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// [`CustomGlyphMeta`] by registry and version, so a frame that finds
+/// its glyphs in the atlas never reads the registry: no lock, no lookup,
+/// no clone of the entry. A registration never changes, so an entry is
+/// never stale; versions are only unique within one registry and panes
+/// share this, hence the registry id.
+#[derive(Default)]
+struct CustomGlyphMetas(FxHashMap<(u64, u32), CustomGlyphMeta>);
+
+impl CustomGlyphMetas {
+    fn get(
+        &mut self,
+        registry: &rio_backend::sugarloaf::font::glyph_registry::GlyphRegistry,
+        version: u32,
+    ) -> Option<CustomGlyphMeta> {
+        let key = (registry.id(), version);
+        if let Some(meta) = self.0.get(&key) {
+            return Some(*meta);
+        }
+        // Gone only if the sweep found no cell using it.
+        let meta = CustomGlyphMeta::of(&registry.get_version(version)?);
+        // Forgetting is always safe, it only costs a lookup. Bounded the
+        // same way as the atlas ids, for a program re-registering forever.
+        if self.0.len() >= MAX_CUSTOM_GLYPH_IDS {
+            self.0.clear();
+        }
+        self.0.insert(key, meta);
+        Some(meta)
+    }
+
+    fn set_unrenderable(
+        &mut self,
+        registry: &rio_backend::sugarloaf::font::glyph_registry::GlyphRegistry,
+        version: u32,
+    ) {
+        if let Some(meta) = self.0.get_mut(&(registry.id(), version)) {
+            meta.unrenderable = true;
+        }
     }
 }
 
@@ -3181,20 +3456,19 @@ fn ensure_custom_glyph_by_codepoint(
     rasterizer: &mut GridGlyphRasterizer,
     registry: &rio_backend::sugarloaf::font::glyph_registry::GlyphRegistry,
     codepoint: u32,
+    version: u32,
     cell_w_u32: u32,
     cell_h: f32,
     foreground_rgba: [u8; 4],
     max_span: u16,
     primary_ascent: impl FnOnce(&mut GridGlyphRasterizer) -> Option<i16>,
 ) -> Option<(GlyphKey, AtlasSlot, bool, u16)> {
-    use rio_backend::sugarloaf::font::glyph_registry::GlyphAlignV;
     use std::sync::atomic::Ordering;
 
-    // Fetch first so we know the registration's version + declared
-    // width. The lookup happens under the registry's RwLock read; the
-    // entry's payload is cloned out so the lock drops before tiny-skia.
-    let entry = registry.get(codepoint)?;
-    if entry.render_state.unrenderable.load(Ordering::Relaxed) {
+    // What the registration the cell was printed with says about its
+    // width and placement; the registry is only read on a miss.
+    let meta = rasterizer.custom_glyph_meta.get(registry, version)?;
+    if meta.unrenderable {
         return None;
     }
 
@@ -3202,19 +3476,21 @@ fn ensure_custom_glyph_by_codepoint(
     // `span × cell_w` box and overflows rightward in pixels. The grid
     // still treats the codepoint as one logical column (no cell was
     // reserved), so this is purely visual. Clamp to the protocol's 1..=2.
-    let span = custom_glyph_span(entry.width, max_span);
+    let span = custom_glyph_span(meta.width, max_span);
     let span_w_px = (cell_w_u32 * span as u32).min(u16::MAX as u32) as u16;
     let cell_h_px = cell_h.round().clamp(0.0, u16::MAX as f32) as u16;
     if span_w_px == 0 || cell_h_px == 0 {
         return None;
     }
-    let baseline_px = match entry.layout.align_v {
-        GlyphAlignV::Baseline => primary_ascent(rasterizer)?,
-        _ => 0,
+    let baseline_px = if meta.baseline {
+        primary_ascent(rasterizer)?
+    } else {
+        0
     };
     let key = rasterizer.custom_glyph_ids.key(custom_glyph_raster(
         codepoint,
-        &entry,
+        version,
+        meta,
         span_w_px,
         cell_h_px,
         baseline_px,
@@ -3227,6 +3503,9 @@ fn ensure_custom_glyph_by_codepoint(
         return Some((key, slot, true, span));
     }
 
+    // Not in the atlas: rasterise it from the registration, cloned out
+    // of the registry so its lock drops before tiny-skia.
+    let entry = registry.get_version(version)?;
     let Some(raster) = rio_backend::sugarloaf::glyph_protocol::rasterize_payload(
         &entry.payload,
         entry.upm,
@@ -3241,6 +3520,9 @@ fn ensure_custom_glyph_by_codepoint(
             .render_state
             .unrenderable
             .store(true, Ordering::Relaxed);
+        rasterizer
+            .custom_glyph_meta
+            .set_unrenderable(registry, version);
         return None;
     };
 
@@ -3597,7 +3879,7 @@ mod preedit_suppression_tests {
         size: u16,
     ) -> Option<f32> {
         let base = text.chars().next()?;
-        let (font_id, _) = r.resolve_font(base, 0, lib, 0);
+        let (font_id, _) = r.resolve_font(base, 0, lib);
         shape_preedit_text(r, text, font_id, size, size, lib)
             .map(|(_, _, advance)| advance)
     }
@@ -3754,7 +4036,7 @@ mod custom_glyph_tests {
         GlyphLayout, GlyphRegistry, StoredPayload,
     };
 
-    const CP: u32 = 0xE0A0;
+    const CP: u32 = 0x10_0000;
     const RED: [u8; 4] = [255, 0, 0, 255];
     const BLUE: [u8; 4] = [0, 0, 255, 255];
 
@@ -3767,7 +4049,9 @@ mod custom_glyph_tests {
     }
 
     fn key(registry: &GlyphRegistry, foreground: [u8; 4]) -> CustomGlyphRaster {
-        custom_glyph_raster(CP, &registry.get(CP).unwrap(), 10, 20, 0, foreground)
+        let entry = registry.get(CP).unwrap();
+        let meta = CustomGlyphMeta::of(&entry);
+        custom_glyph_raster(CP, entry.version, meta, 10, 20, 0, foreground)
     }
 
     fn raster(codepoint: u32) -> CustomGlyphRaster {
@@ -3850,11 +4134,13 @@ mod custom_glyph_tests {
             )
             .unwrap();
         let first = key(&registry, RED);
-        for _ in 0..4096 {
+        // Each a different glyph: an identical one keeps the current
+        // registration, and with it the key.
+        for i in 0..4096u32 {
             registry
                 .register(
                     CP,
-                    StoredPayload::glyf(vec![1]),
+                    StoredPayload::glyf(i.to_le_bytes().to_vec()),
                     1000,
                     1,
                     GlyphLayout::default(),
@@ -3862,6 +4148,75 @@ mod custom_glyph_tests {
                 .unwrap();
             assert_ne!(key(&registry, RED), first);
         }
+    }
+
+    #[test]
+    fn registration_facts_are_cached_per_registry() {
+        let glyph = |width| {
+            let registry = GlyphRegistry::new();
+            registry
+                .register(
+                    CP,
+                    StoredPayload::glyf(vec![1]),
+                    1000,
+                    width,
+                    GlyphLayout::default(),
+                )
+                .unwrap();
+            registry
+        };
+        // Two sessions, each with its first registration at CP: the same
+        // version, different glyphs.
+        let (narrow, wide) = (glyph(1), glyph(2));
+        let version = narrow.get(CP).unwrap().version;
+        assert_eq!(wide.get(CP).unwrap().version, version);
+        let mut metas = CustomGlyphMetas::default();
+        assert_eq!(metas.get(&narrow, version).unwrap().width, 1);
+        assert_eq!(metas.get(&wide, version).unwrap().width, 2);
+
+        // Once cached, drawing doesn't read the registry: still answered
+        // after the registration is gone from it.
+        narrow.reset();
+        assert!(narrow.get_version(version).is_none());
+        assert_eq!(metas.get(&narrow, version).unwrap().width, 1);
+        // Unknown and never cached: nothing to draw.
+        assert!(metas.get(&narrow, version + 1).is_none());
+
+        metas.set_unrenderable(&wide, version);
+        assert!(metas.get(&wide, version).unwrap().unrenderable);
+        assert!(!metas.get(&narrow, version).unwrap().unrenderable);
+    }
+
+    #[test]
+    fn a_cell_draws_the_registration_it_was_printed_with() {
+        use rio_backend::crosswords::square::Extras;
+        let mut extras = ExtrasMap::default();
+        extras.insert(
+            1,
+            Extras {
+                glyph: Some(42),
+                ..Default::default()
+            },
+        );
+        extras.insert(2, Extras::default());
+        let cell = |c: char, id: Option<u16>| {
+            let mut sq = Square::from_char(c);
+            sq.set_extras_id(id);
+            sq
+        };
+        let block = char::from_u32(CP).unwrap();
+        assert_eq!(bound_glyph_version(&extras, cell(block, Some(1))), Some(42));
+        // Printed with nothing registered, or extras without a binding.
+        assert_eq!(bound_glyph_version(&extras, cell(block, None)), None);
+        assert_eq!(bound_glyph_version(&extras, cell(block, Some(2))), None);
+        // Only block codepoints bind; anything else isn't even looked up.
+        assert_eq!(bound_glyph_version(&extras, cell('a', Some(1))), None);
+        // A bg-only cell whose colour bits happen to spell a block
+        // codepoint and a bound extras id is still just a colour.
+        let mut bg = cell(block, Some(1));
+        bg.set_bg_rgb(0x10, 0x00, 0x01);
+        assert!(bg.is_bg_only());
+        assert_eq!(bound_glyph_version(&extras, bg), None);
     }
 
     #[test]
@@ -3877,10 +4232,11 @@ mod custom_glyph_tests {
             )
             .unwrap();
         let entry = registry.get(CP).unwrap();
-        let base = custom_glyph_raster(CP, &entry, 10, 20, 15, RED);
+        let (v, meta) = (entry.version, CustomGlyphMeta::of(&entry));
+        let base = custom_glyph_raster(CP, v, meta, 10, 20, 15, RED);
         // Cell widths 8 apart, and ascents that differ by one pixel.
-        assert_ne!(base, custom_glyph_raster(CP, &entry, 18, 20, 15, RED));
-        assert_ne!(base, custom_glyph_raster(CP, &entry, 10, 20, 16, RED));
+        assert_ne!(base, custom_glyph_raster(CP, v, meta, 18, 20, 15, RED));
+        assert_ne!(base, custom_glyph_raster(CP, v, meta, 10, 20, 16, RED));
     }
 
     #[test]
@@ -3899,5 +4255,125 @@ mod custom_glyph_tests {
         marked.insert_cell_flag(CellFlags::GRAPHEME);
         row[Column(1)] = marked;
         assert_eq!(custom_glyph_room(&row, 0, 3), 1, "a space with a mark");
+    }
+}
+
+#[cfg(test)]
+mod grapheme_query_tests {
+    use super::*;
+    use rio_backend::ansi::glyph_protocol::QueryStatus;
+    use rio_backend::sugarloaf::font::glyph_registry::{
+        GlyphLayout, GlyphRegistry, StoredPayload,
+    };
+
+    const FAMILY: [char; 5] = [
+        '\u{1F468}',
+        '\u{200D}',
+        '\u{1F469}',
+        '\u{200D}',
+        '\u{1F467}',
+    ];
+
+    #[test]
+    fn emoji_sequences_per_uts_51() {
+        assert!(is_emoji_sequence(&FAMILY));
+        assert!(is_emoji_sequence(&['\u{1F44D}', '\u{1F3FD}']));
+        assert!(is_emoji_sequence(&['\u{1F1E7}', '\u{1F1F7}']));
+        assert!(is_emoji_sequence(&['1', '\u{FE0F}', '\u{20E3}']));
+        // A lone emoji, with or without a selector, is not a sequence.
+        assert!(!is_emoji_sequence(&['\u{1F600}']));
+        assert!(!is_emoji_sequence(&['\u{231A}', '\u{FE0E}']));
+        // Nor is text with marks.
+        assert!(!is_emoji_sequence(&['e', '\u{301}']));
+    }
+
+    #[test]
+    fn a_registered_glyph_draws_alone() {
+        const BLOCK: u32 = 0x10_0000;
+        const ROUTE: usize = 7;
+        let font_library = FontLibrary::default();
+        let registry = GlyphRegistry::new();
+        registry
+            .register(
+                BLOCK,
+                StoredPayload::glyf(vec![1]),
+                1000,
+                1,
+                GlyphLayout::default(),
+            )
+            .unwrap();
+        font_library.install_glyph_registry(ROUTE, registry);
+        let mut r = GridGlyphRasterizer::new();
+        let block = char::from_u32(BLOCK).unwrap();
+
+        assert_eq!(
+            r.grapheme_query_status(&[block], &font_library, ROUTE),
+            QueryStatus::Glossary
+        );
+        // Default-ignorables after it change nothing.
+        assert_eq!(
+            r.grapheme_query_status(&[block, '\u{FE0F}'], &font_library, ROUTE),
+            QueryStatus::Glossary
+        );
+        // A visible mark would not be drawn with it.
+        assert_eq!(
+            r.grapheme_query_status(&[block, '\u{301}'], &font_library, ROUTE),
+            QueryStatus::Free
+        );
+        // Another session never registered it.
+        assert_eq!(
+            r.grapheme_query_status(&[block], &font_library, ROUTE + 1),
+            QueryStatus::Free
+        );
+    }
+
+    #[test]
+    fn an_unassigned_codepoint_is_tofu() {
+        let font_library = FontLibrary::default();
+        let mut r = GridGlyphRasterizer::new();
+        assert_eq!(
+            r.grapheme_query_status(&['\u{378}'], &font_library, 0),
+            QueryStatus::Free
+        );
+        assert_eq!(
+            r.grapheme_query_status(&['a', '\u{378}'], &font_library, 0),
+            QueryStatus::Free
+        );
+    }
+
+    /// Strict only where an emoji font is guaranteed (Apple Color
+    /// Emoji); a fontless Linux container has nothing to join with.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn emoji_sequences_must_join() {
+        let font_library = FontLibrary::default();
+        let mut r = GridGlyphRasterizer::new();
+        assert_eq!(
+            r.grapheme_query_status(&FAMILY, &font_library, 0),
+            QueryStatus::System
+        );
+        assert_eq!(
+            r.grapheme_query_status(&['\u{1F44D}', '\u{1F3FD}'], &font_library, 0),
+            QueryStatus::System
+        );
+        // Not an RGI sequence: every codepoint is covered, but it
+        // shapes to a dinosaur and a pizza.
+        assert_eq!(
+            r.grapheme_query_status(
+                &['\u{1F996}', '\u{200D}', '\u{1F355}'],
+                &font_library,
+                0
+            ),
+            QueryStatus::Free
+        );
+        // Text presentation and combining marks.
+        assert_eq!(
+            r.grapheme_query_status(&['\u{231A}', '\u{FE0E}'], &font_library, 0),
+            QueryStatus::System
+        );
+        assert_eq!(
+            r.grapheme_query_status(&['e', '\u{301}'], &font_library, 0),
+            QueryStatus::System
+        );
     }
 }
