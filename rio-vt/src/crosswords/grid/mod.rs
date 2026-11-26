@@ -624,8 +624,10 @@ impl<T> Grid<T> {
         self.truncate();
 
         // Initialize everything with empty new lines.
-        self.raw
-            .initialize(self.max_scroll_limit - self.history_size(), self.columns);
+        self.raw.initialize(
+            self.max_scroll_limit.saturating_sub(self.history_size()),
+            self.columns,
+        );
     }
 
     /// This is used only for truncating before saving ref-tests.

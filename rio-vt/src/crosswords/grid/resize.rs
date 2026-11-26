@@ -682,7 +682,7 @@ impl Grid<Square> {
         let mut reversed = new_raw;
         // Reflow can overflow the scrollback cap; the oldest lines
         // fall off the ring and must advance the absolute row base.
-        let cap = self.max_scroll_limit + self.lines;
+        let cap = self.max_scroll_limit.saturating_add(self.lines);
         if reversed.len() > cap {
             self.total_lines_scrolled += (reversed.len() - cap) as u64;
         }

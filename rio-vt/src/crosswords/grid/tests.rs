@@ -989,3 +989,14 @@ fn display_iter_starts_at_the_top_of_the_viewport() {
     grid.scroll_display(Scroll::Delta(1));
     assert_eq!(visible(&grid), "abcxyz", "scrolled to the top of history");
 }
+
+#[test]
+fn an_unbounded_scroll_limit_survives_a_reflow() {
+    let mut grid = Grid::<Square>::new(4, 10, usize::MAX);
+    for _ in 0..20 {
+        grid.scroll_up(&(Line(0)..Line(4)), 1);
+    }
+    assert!(grid.history_size() >= 16);
+    grid.resize(true, 6, 8);
+    assert!(grid.history_size() > 0);
+}
